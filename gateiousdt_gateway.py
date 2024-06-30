@@ -790,8 +790,8 @@ class GateioUsdtWebsocketApi(WebsocketClient):
         self.ticks[req.symbol] = tick
         self.subscribed[req.symbol] = req
         # 订阅tick行情
-        tick_req = self.generate_req(channel="futures.tickers", event="subscribe", pay_load=[req.symbol])
-        self.send_packet(tick_req)
+        #tick_req = self.generate_req(channel="futures.tickers", event="subscribe", pay_load=[req.symbol])
+        #self.send_packet(tick_req)
         # 20ms深度推送只支持20档位
         depth_req = self.generate_req(channel="futures.order_book_update", event="subscribe", pay_load=[req.symbol, "20ms", "20"])
         self.send_packet(depth_req)
@@ -863,21 +863,14 @@ class GateioUsdtWebsocketApi(WebsocketClient):
         """
         timestamp = raw["t"]
         symbol = raw["s"]
-        tick = self.ticks[symbol]
+        tick: TickData = self.ticks[symbol]
                 
         # 更新买单和卖单
         update_order_book(self.order_book_bids[symbol], raw["b"])
         update_order_book(self.order_book_asks[symbol], raw["a"])
 
-        # 设置最高的5个买单和卖单价格及数量
-        def set_top_prices_volumes(order_book:Dict[float,float], prefix:str):
-            sorted_items = sorted(order_book.items(), key=lambda x: x[0], reverse=(prefix == "bid"))[:5]
-            for index, (price, volume) in enumerate(sorted_items, start=1):
-                setattr(tick, f"{prefix}_price_{index}", price)
-                setattr(tick, f"{prefix}_volume_{index}", volume)
-        
-        set_top_prices_volumes(self.order_book_bids[symbol], "bid")
-        set_top_prices_volumes(self.order_book_asks[symbol], "ask")
+        set_top_prices_volumes(tick,self.order_book_bids[symbol], "bid")
+        set_top_prices_volumes(tick,self.order_book_asks[symbol], "ask")
         
         # 更新时间
         tick.datetime = generate_datetime_ms(timestamp)
@@ -1176,6 +1169,12 @@ def update_order_book(order_book:Dict[float,float], data:List[Dict[str,Union[str
             order_book[price] = volume
         else:
             order_book.pop(price, None)
+# 设置最高的5个买单和卖单价格及数量
+def set_top_prices_volumes(tick: TickData,order_book:Dict[float,float], prefix:str):
+    sorted_items = sorted(order_book.items(), key=lambda x: x[0], reverse=(prefix == "bid"))[:5]
+    for index, (price, volume) in enumerate(sorted_items, start=1):
+        setattr(tick, f"{prefix}_price_{index}", price)
+        setattr(tick, f"{prefix}_volume_{index}", volume)
 # ----------------------------------------------------------------------------------------------------
 def get_order_type(order_type_str: str) -> OrderType:
     """
