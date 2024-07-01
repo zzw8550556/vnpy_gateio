@@ -723,8 +723,8 @@ class GateioUsdtWebsocketApi(WebsocketClient):
             "futures.book_ticker":self.on_book_ticker,
             "futures.trades":self.on_public_trade,
             "futures.orders": self.on_order,
-            "futures.autoorders": self.on_plan_orders,
-            #"futures.usertrades": self.on_trade,
+            "futures.autoorders": self.on_aotoorders,
+            "futures.usertrades": self.on_trade,
             "futures.positions": self.on_position,
         }
     # ----------------------------------------------------------------------------------------------------
@@ -774,7 +774,7 @@ class GateioUsdtWebsocketApi(WebsocketClient):
         topic = [
             #"futures.usertrades",
             "futures.orders",
-            "futures.autoorders",
+            "futures.autoorders",#不完全使用这个频道的信息，只响应建立订单的消息，不响应成交消息，因为成交消息里没有成交价
             "futures.positions",
         ]
         for channel in topic:
@@ -905,9 +905,14 @@ class GateioUsdtWebsocketApi(WebsocketClient):
         收到委托单回报
         """
         for data in raw:
-            if data["text"].startswith("ao"):#'ao-75605130'ao开头是计划委托单，在on_plan_order处理，不需要在这里处理
+            if data["text"].startswith("ao"):#'ao-75605130'ao开头是计划委托单，在on_plan_order处理
+                self.on_plan_order(raw)
                 continue
-
+            if data["text"].startswith("t-"):
+                orderidstr=str(data["text"][2:])
+            else:
+                orderidstr=str(data["text"])
+                
             if data["size"] > 0:
                 direction = Direction.LONG
             else:
@@ -919,7 +924,7 @@ class GateioUsdtWebsocketApi(WebsocketClient):
             status = get_order_status(data["status"], volume, traded)
             reduce_only = data["is_reduce_only"]
             order = OrderData(
-                orderid=str(data["text"][2:]),
+                orderid=orderidstr,
                 symbol=data["contract"],
                 exchange=Exchange.GATEIO,
                 price=float(data["price"]),
@@ -961,9 +966,86 @@ class GateioUsdtWebsocketApi(WebsocketClient):
             )
             self.gateway.on_trade(trade)
 
-    def on_plan_orders(self, raw: List):
+    def on_plan_order(self, raw: List):
         """
-        收到计划委托单回报
+        收到委托单是是计划委托单时的处理
+        """
+        for data in raw:
+            id=data["text"][3:]
+            found = False
+            for orderid_str in self.gateway.orders:
+                if self.gateway.orders[orderid_str].reference==id:
+                    orderid=orderid_str
+                    found = True
+                    break
+            if not found:
+                orderid=id
+            if data["size"] > 0:
+                direction = Direction.LONG
+            else:
+                direction = Direction.SHORT
+            
+            volume = abs(float(data["size"]))
+            reduce_only = data["is_reduce_only"]
+            status = get_order_status_exact(data)
+            if data["status"]=="finished" and data["finish_as"]=="filled":
+                traded=volume
+            else:
+                traded = 0
+            if data["finish_time"]>0:
+                ordertime = generate_datetime(data["finish_time"])
+            else:
+                ordertime = generate_datetime(data["create_time"])
+            order = OrderData(
+                orderid=orderid,
+                symbol=data["contract"],
+                exchange=Exchange.GATEIO,
+                price=float(data["fill_price"]),
+                volume=volume,
+                traded=traded,
+                type=OrderType.STOP,
+                direction=direction,
+                status=status,
+                datetime=ordertime,
+                gateway_name=self.gateway_name,
+            )
+            if found==True:
+                order.reference=str(data["id"])
+            if reduce_only:
+                order.offset = Offset.CLOSE
+            else:
+                order.offset = Offset.OPEN
+
+            self.gateway.on_order(order)
+
+            # 将成交数量四舍五入到正确精度
+            trade_volume: float = abs(float(data["size"]))
+            contract: ContractData = symbol_contract_map.get(order.symbol, None)
+            if contract:
+                trade_volume = round_to(trade_volume, contract.min_volume)
+
+            if status!=Status.ALLTRADED:
+                continue
+
+            trade: TradeData = TradeData(
+                symbol=order.symbol,
+                exchange=order.exchange,
+                orderid=order.orderid,
+                tradeid="trade-"+str(data["id"]),
+                direction=order.direction,
+                price=float(data["fill_price"]),
+                volume=trade_volume,
+                datetime=generate_datetime(data["finish_time"]),
+                gateway_name=self.gateway_name,
+                offset=order.offset
+            )
+            self.gateway.on_trade(trade)
+
+    def on_aotoorders(self, raw: List):
+        """
+        收到计划委托单回报,
+        这个回调里只响应建立\取消\拒绝订单的消息,不响应成交消息,也不响应其他消息
+        成交消息根据futures.orders频道的消息,在on_order里响应
         """
         for data in raw:
             id=str(data["id"])
@@ -983,58 +1065,32 @@ class GateioUsdtWebsocketApi(WebsocketClient):
             volume = abs(float(data["initial"]["size"]))
             reduce_only = data["initial"]["is_reduce_only"]
             status = get_plan_order_status(data)
-            if data["status"]=="finished" and data["finish_as"]=="succeeded":
-                traded=volume
-            else:
-                traded = 0
-            if data["finish_time"]>0:
-                ordertime = generate_datetime(data["finish_time"])
-            else:
-                ordertime = generate_datetime(data["create_time"])
-            order = OrderData(
-                orderid=orderid,
-                symbol=data["initial"]["contract"],
-                exchange=Exchange.GATEIO,
-                price=float(data["trigger"]["price"]),
-                volume=volume,
-                traded=traded,
-                type=OrderType.STOP,
-                direction=direction,
-                status=status,
-                datetime=ordertime,
-                gateway_name=self.gateway_name,
-            )
-            if found==True:
-                order.reference=str(data["id"])
-            if reduce_only:
-                order.offset = Offset.CLOSE
-            else:
-                order.offset = Offset.OPEN
+            if status == Status.NOTTRADED or status == Status.REJECTED or status == Status.CANCELLED:
+                if data["finish_time"]>0:
+                    ordertime = generate_datetime(data["finish_time"])
+                else:
+                    ordertime = generate_datetime(data["create_time"])
+                order = OrderData(
+                    orderid=orderid,
+                    symbol=data["initial"]["contract"],
+                    exchange=Exchange.GATEIO,
+                    price=float(data["trigger"]["price"]),
+                    volume=volume,
+                    traded=0,
+                    type=OrderType.STOP,
+                    direction=direction,
+                    status=status,
+                    datetime=ordertime,
+                    gateway_name=self.gateway_name,
+                )
+                if found==True:
+                    order.reference=str(data["id"])
+                if reduce_only:
+                    order.offset = Offset.CLOSE
+                else:
+                    order.offset = Offset.OPEN
 
-            self.gateway.on_order(order)
-
-            # 将成交数量四舍五入到正确精度
-            trade_volume: float = abs(float(data["initial"]["size"]))
-            contract: ContractData = symbol_contract_map.get(order.symbol, None)
-            if contract:
-                trade_volume = round_to(trade_volume, contract.min_volume)
-
-            if status!=Status.ALLTRADED:
-                continue
-
-            trade: TradeData = TradeData(
-                symbol=order.symbol,
-                exchange=order.exchange,
-                orderid=order.orderid,
-                tradeid=data["trade_id"],
-                direction=order.direction,
-                price=float(data["trigger"]["price"]),
-                volume=trade_volume,
-                datetime=generate_datetime(data["finish_time"]),
-                gateway_name=self.gateway_name,
-                offset=order.offset
-            )
-            self.gateway.on_trade(trade)
+                self.gateway.on_order(order)
             
     # ----------------------------------------------------------------------------------------------------
     def on_trade(self, raw: List):
@@ -1143,6 +1199,23 @@ def get_order_status(status: str, volume: int, traded: int):
             return Status.ALLTRADED
         else:
             return Status.CANCELLED
+def get_order_status_exact(raw:List):
+    status=raw["status"]
+    if status == "open":
+        return Status.NOTTRADED
+    elif status == "finished":
+        finish_as=raw["finish_as"]
+        if finish_as == "cancelled":
+            return Status.CANCELLED
+        if finish_as == "filled":
+            return Status.ALLTRADED
+        if finish_as == "ioc" or finish_as == "auto_deleveraging":
+            return Status.ALLTRADED
+        if finish_as == "liquidated" or finish_as == "reduce_only" or finish_as == "position_close" or finish_as == "stp":
+            return Status.CANCELLED
+    else:
+        return Status.NOTTRADED
+
 def get_plan_order_status(raw:List):
     status=raw["status"]
     if status == "open":
